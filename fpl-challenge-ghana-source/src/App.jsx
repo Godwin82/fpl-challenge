@@ -211,6 +211,12 @@ async function fetchFPLGameweeks() {
     id: e.id,
     number: e.id,
     status: e.finished ? "COMPLETED" : e.is_current ? "OPEN" : "COMING_SOON",
+    // "finished" flips true as soon as the last match ends, but FPL still
+    // needs time afterward to finalize bonus points and process automatic
+    // substitutions (bench players swapped in for starters who didn't play).
+    // "data_checked" only flips true once that processing is actually done —
+    // until then, a synced score can still move.
+    dataChecked: !!e.data_checked,
     fee: 50,
     prizePool: 500,
     deadline: formatDeadline(e.deadline_time),
@@ -459,8 +465,11 @@ function LeaderboardPage({ gameweeks, registrations, setRegistrations, activeGwI
     setSyncing(true);
     setSyncNote("");
 
-    if (!openGw || gw.id !== openGw.id) {
-      // Not the live gameweek — nothing to sync, points here are final/frozen.
+    // Allowed to sync: the gameweek FPL currently has open, OR a just-finished
+    // one where bonus points/substitutions haven't been finalized yet (so the
+    // number can still move). Anything else is genuinely frozen.
+    const canSync = (openGw && gw.id === openGw.id) || (gw.status === "COMPLETED" && !gw.dataChecked);
+    if (!canSync) {
       setSyncNote(gw.status === "COMPLETED" ? "This gameweek is finished — points are final." : "This gameweek isn't live yet.");
       setSyncing(false);
       return;
@@ -468,7 +477,7 @@ function LeaderboardPage({ gameweeks, registrations, setRegistrations, activeGwI
 
     let failures = 0;
     const updated = await Promise.all(rows.map(async (r) => {
-      const result = await fetchLivePoints(r.teamId, openGw.number);
+      const result = await fetchLivePoints(r.teamId, gw.number);
       if (!result.live) { failures += 1; return r; }
       await updateRegistrationPoints(r.id, result.points);
       return { ...r, points: result.points };
@@ -479,6 +488,7 @@ function LeaderboardPage({ gameweeks, registrations, setRegistrations, activeGwI
     if (rows.length === 0) setSyncNote("No one registered for this gameweek yet.");
     else if (failures === rows.length) setSyncNote("Couldn't reach live FPL data right now — points shown are from the last successful sync. Try again shortly.");
     else if (failures > 0) setSyncNote(`Synced, but ${failures} team${failures === 1 ? "" : "s"} couldn't be reached — showing their last known points.`);
+    else if (gw.status === "COMPLETED" && !gw.dataChecked) setSyncNote("Matches have ended, but FPL hasn't finished finalizing bonus points and substitutions yet — these numbers can still change. Check back later and sync again.");
 
     setLastSync(new Date().toLocaleTimeString());
     setSyncing(false);

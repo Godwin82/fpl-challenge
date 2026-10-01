@@ -182,10 +182,46 @@ async function fetchViaProxies(target) {
   return null;
 }
 
-async function fetchLivePoints(teamId, eventNumber) {
+/**
+ * Replaces the naive "just trust entry_history.points" approach with a
+ * manual recomputation that excludes two specific chip effects, per the
+ * competition's rules:
+ *  - Triple Captain ("3xc"): captain's multiplier is capped back to the
+ *    normal 2x instead of FPL's 3x.
+ *  - Bench Boost ("bboost"): bench players (picks position 12-15) are
+ *    excluded entirely, instead of counting as FPL normally would when
+ *    that chip is active.
+ * Everything else — normal captaincy, ordinary automatic substitutions,
+ * Wildcard, Free Hit — is left exactly as FPL calculated it, since those
+ * don't inflate the score in a way this competition wants removed.
+ *
+ * Needs each player's individual gameweek score, which comes from FPL's
+ * per-event "live" endpoint. That's a big, shared payload — fetch it once
+ * per leaderboard refresh (fetchEventLive) and reuse it for every
+ * registered team, rather than re-fetching per person.
+ */
+async function fetchEventLive(eventNumber) {
+  const data = await fetchViaProxies(`https://fantasy.premierleague.com/api/event/${eventNumber}/live/`);
+  if (!data || !data.elements) return null;
+  const map = {};
+  for (const el of data.elements) map[el.id] = el.stats ? el.stats.total_points : 0;
+  return map;
+}
+
+async function fetchLivePoints(teamId, eventNumber, liveMap) {
   const data = await fetchViaProxies(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${eventNumber}/picks/`);
-  if (!data || !data.entry_history) return { points: null, live: false };
-  return { points: data.entry_history.points, live: true };
+  if (!data || !data.picks || !liveMap) return { points: null, live: false };
+
+  const chip = data.active_chip; // "3xc", "bboost", "wildcard", "freehit", or null
+  let total = 0;
+  for (const p of data.picks) {
+    let multiplier = p.multiplier;
+    if (chip === "3xc" && p.is_captain && multiplier === 3) multiplier = 2; // de-boost triple captain
+    if (chip === "bboost" && p.position > 11) multiplier = 0; // exclude bench-boosted bench players
+    const playerPoints = liveMap[p.element] || 0;
+    total += playerPoints * multiplier;
+  }
+  return { points: total, live: true };
 }
 
 function formatDeadline(iso) {
@@ -468,16 +504,28 @@ function LeaderboardPage({ gameweeks, registrations, setRegistrations, activeGwI
     // Allowed to sync: the gameweek FPL currently has open, OR a just-finished
     // one where bonus points/substitutions haven't been finalized yet (so the
     // number can still move). Anything else is genuinely frozen.
-    const canSync = (openGw && gw.id === openGw.id) || (gw.status === "COMPLETED" && !gw.dataChecked);
-    if (!canSync) {
-      setSyncNote(gw.status === "COMPLETED" ? "This gameweek is finished — points are final." : "This gameweek isn't live yet.");
+    // Any gameweek can be manually re-synced — including ones FPL has
+    // already fully finalized. That matters when the scoring rules
+    // themselves change (e.g. excluding Triple Captain/Bench Boost
+    // bonuses): without this, a past gameweek's stored points would stay
+    // frozen under whatever rule was in effect last time someone synced
+    // it. The only thing blocked is a gameweek that hasn't started yet.
+    if (gw.status === "COMING_SOON") {
+      setSyncNote("This gameweek isn't live yet.");
       setSyncing(false);
       return;
     }
 
     let failures = 0;
+    const liveMap = await fetchEventLive(gw.number);
+    if (!liveMap) {
+      setSyncNote("Couldn't reach live FPL data right now — points shown are from the last successful sync. Try again shortly.");
+      setLastSync(new Date().toLocaleTimeString());
+      setSyncing(false);
+      return;
+    }
     const updated = await Promise.all(rows.map(async (r) => {
-      const result = await fetchLivePoints(r.teamId, gw.number);
+      const result = await fetchLivePoints(r.teamId, gw.number, liveMap);
       if (!result.live) { failures += 1; return r; }
       await updateRegistrationPoints(r.id, result.points);
       return { ...r, points: result.points };
@@ -489,6 +537,7 @@ function LeaderboardPage({ gameweeks, registrations, setRegistrations, activeGwI
     else if (failures === rows.length) setSyncNote("Couldn't reach live FPL data right now — points shown are from the last successful sync. Try again shortly.");
     else if (failures > 0) setSyncNote(`Synced, but ${failures} team${failures === 1 ? "" : "s"} couldn't be reached — showing their last known points.`);
     else if (gw.status === "COMPLETED" && !gw.dataChecked) setSyncNote("Matches have ended, but FPL hasn't finished finalizing bonus points and substitutions yet — these numbers can still change. Check back later and sync again.");
+    else if (gw.status === "COMPLETED" && gw.dataChecked) setSyncNote("Final — recalculated using the current scoring rules.");
 
     setLastSync(new Date().toLocaleTimeString());
     setSyncing(false);
@@ -496,7 +545,7 @@ function LeaderboardPage({ gameweeks, registrations, setRegistrations, activeGwI
 
   return (
     <Container style={{ padding: "32px 0 48px" }}>
-      <PageHead title="Leaderboard" />
+      <PageHead title="Leaderboard" sub="Scores exclude Triple Captain and Bench Boost bonuses — captain is always capped at 2x, and bench points never count, regardless of chip." />
       <select className="select" value={gw.id} onChange={(e) => setActiveGwId(Number(e.target.value))}>
         {gameweeks.filter((g) => g.status !== "COMING_SOON").map((g) => <option key={g.id} value={g.id}>Gameweek {g.number}</option>)}
       </select>
